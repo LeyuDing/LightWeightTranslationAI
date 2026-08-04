@@ -1,0 +1,6 @@
+paddleocr
+transformers
+pytorch
+torchvision
+accelerate
+opencv-python
