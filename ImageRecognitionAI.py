@@ -2,6 +2,7 @@ from paddleocr import PaddleOCR
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 import cv2 as cv
 import time
+import threading
 import os # Only needed for testing purposes
 
 # Make sure PaddlePaddle is installed and on version 3.2.0
@@ -37,31 +38,39 @@ tokenizer.src_lang = "eng_Latn"
 # Video Capture 
 cap = cv.VideoCapture(0)
 
-interval = 1.0
-last_time = time.time()
+# Storage Variables
+cap_frame = None
+ocr_result = None
 
-if not cap.isOpened():
-    print("Cannot open camera")
-    exit()
+# Reads the current frame of the video
+def video_capture(cap, interval):
+    last_time = time.time()
 
-while True:
+    if not cap.isOpened():
+        print("Cannot open camera")
+        exit()
+
     # Capture frame-by-frame
     ret, frame = cap.read()
 
     # If frame is read correctly ret is True
     if not ret:
         print("Can't receive frame (stream end?). Exiting ...")
-        break
+        return
 
     if time.time() - last_time >= interval:
-        last_time = time.time()
+        cap_frame = frame
 
-        # Extracting data from the video
-        result = ocr.predict(frame) 
+# Extracts text from an image
+def ocr_predict(ocr):
+    while True:
+        ocr_result = ocr.predict(cap_frame)
 
-        # Getting the texts in the image
-        texts = result[0]["rec_texts"]
-        confidence = result[0]["rec_scores"]
+
+# Translates text
+def translate(tokenizer, model):
+    while True:
+        texts = ocr_result[0]["rec_texts"]
 
         # Translating
         for i, text in enumerate(texts):
@@ -74,19 +83,15 @@ while True:
 
             )
 
-            # Translating the texts while filtering out the ones with low confidence
-            texts[i] = texts[i] if confidence[i] < 0.95 else tokenizer.batch_decode(
+            # Translating the texts 
+            texts[i] = tokenizer.batch_decode(
                 translated_tokens, 
                 skip_special_tokens=True)[0]
 
         # Saving the result
-        for res in result:  
+        for res in ocr_result:  
             res.save_to_img(os.path.join("output", "ocr_result.jpg"))  
             res.save_to_json(os.path.join("output", "ocr_result.json"))
-
-    # If q is pressed exit camera loop
-    if cv.waitKey(1) == ord('q'):
-        break
 
 ## When everything done, release the capture
 cap.release()
