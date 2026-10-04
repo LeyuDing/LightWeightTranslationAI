@@ -5,6 +5,7 @@ import time
 import threading 
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION 
 import os # Only needed for testing purposes 
+import torch
 
 os.makedirs("output", exist_ok=True) 
  
@@ -97,6 +98,8 @@ def translate(tokenizer, model):
     print("Start translation") 
  
     last_result = None 
+
+    cache = {} 
  
     while running: 
         with ocr_lock: 
@@ -110,20 +113,22 @@ def translate(tokenizer, model):
         texts = list(result[0]["rec_texts"]) 
  
         # Translating 
-        batch_size = 16
-        translated = []
-        for start in range(0, len(texts), batch_size):
-            chunk = texts[start:start + batch_size]
-            inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True).to(model.device)
-            out = model.generate(
-                **inputs,
-                forced_bos_token_id=tokenizer.convert_tokens_to_ids("zho_Hans"),
-                max_length=50,
-            )
-            translated.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
-        texts = translated
- 
-        result[0]["rec_texts"] = texts 
+        missing = [t for t in dict.fromkeys(texts) if t not in cache] 
+
+        for start in range(0, len(missing), 16): 
+            chunk = missing[start:start + 16] 
+            inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True).to(model.device) 
+            with torch.inference_mode(): 
+                out = model.generate( 
+                    **inputs, 
+                    forced_bos_token_id=tokenizer.convert_tokens_to_ids("zho_Hans"), 
+                    num_beams=1, 
+                    do_sample=False, 
+                    max_new_tokens=50, 
+                    ) 
+            cache.update(zip(chunk, tokenizer.batch_decode(out, skip_special_tokens=True))) 
+
+        result[0]["rec_texts"] = [cache[t] for t in texts]
  
         # Saving the result 
         for res in result:   

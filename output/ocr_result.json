@@ -5,26 +5,7 @@
         "use_doc_preprocessor": false,
         "use_textline_orientation": true
     },
-    "dt_polys": [
-        [
-            [
-                250,
-                193
-            ],
-            [
-                398,
-                184
-            ],
-            [
-                406,
-                313
-            ],
-            [
-                258,
-                323
-            ]
-        ]
-    ],
+    "dt_polys": [],
     "text_det_params": {
         "limit_side_len": 64,
         "limit_type": "min",
@@ -34,43 +15,10 @@
         "unclip_ratio": 1.5
     },
     "text_type": "general",
-    "textline_orientation_angles": [
-        0
-    ],
     "text_rec_score_thresh": 0.0,
     "return_word_box": false,
-    "rec_texts": [
-        "其他"
-    ],
-    "rec_scores": [
-        0.31826072931289673
-    ],
-    "rec_polys": [
-        [
-            [
-                250,
-                193
-            ],
-            [
-                398,
-                184
-            ],
-            [
-                406,
-                313
-            ],
-            [
-                258,
-                323
-            ]
-        ]
-    ],
-    "rec_boxes": [
-        [
-            250,
-            184,
-            406,
-            323
-        ]
-    ]
+    "rec_texts": [],
+    "rec_scores": [],
+    "rec_polys": [],
+    "rec_boxes": []
 }
