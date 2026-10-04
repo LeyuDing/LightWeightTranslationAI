@@ -1,95 +1,156 @@
-from paddleocr import PaddleOCR
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-import cv2 as cv
-import time
-import os # Only needed for testing purposes
+from paddleocr import PaddleOCR 
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer 
+import cv2 as cv 
+import time 
+import threading 
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION 
+import os # Only needed for testing purposes 
 
-# Make sure PaddlePaddle is installed and on version 3.2.0
-# Uses PP-OCRv6 models by default
-# ocr = PaddleOCR(
-#     use_doc_orientation_classify=False, # Disables document orientation classification model via this parameter
-#     use_doc_unwarping=False, # Disables text image rectification model via this parameter
-#     use_textline_orientation=False, # Disables text line orientation classification model via this parameter
-# )
-# ocr = PaddleOCR(lang="en") # Uses English model by specifying language parameter
-# ocr = PaddleOCR(ocr_version="PP-OCRv5") # Switches to PP-OCRv5 version via ocr_version parameter
-# ocr = PaddleOCR(ocr_version="PP-OCRv4") # Switches to PP-OCRv4 version via ocr_version parameter
-# ocr = PaddleOCR(device="gpu") # Enables GPU acceleration for model inference via device parameter
-
-# Set Up
-# Switch to PP-OCRv5 mobile models
-ocr = PaddleOCR(
-    text_detection_model_name="PP-OCRv5_mobile_det",
-    text_recognition_model_name="PP-OCRv5_mobile_rec",
-    use_doc_orientation_classify=False,
-    use_doc_unwarping=False,
-    use_textline_orientation=True,
-    engine="transformers",
+os.makedirs("output", exist_ok=True) 
+ 
+# Switch to PP-OCRv5 mobile models 
+ocr = PaddleOCR( 
+    text_detection_model_name="PP-OCRv5_mobile_det", 
+    text_recognition_model_name="PP-OCRv5_mobile_rec", 
+    use_doc_orientation_classify=False, 
+    use_doc_unwarping=False, 
+    use_textline_orientation=True, 
+    engine="transformers", 
+)  
+ 
+# Tokenizer for the translator 
+tokenizer = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M") 
+model = AutoModelForSeq2SeqLM.from_pretrained( 
+    "facebook/nllb-200-distilled-600M", 
 ) 
-
-# Tokenizer for the translator
-tokenizer = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M")
-model = AutoModelForSeq2SeqLM.from_pretrained(
-    "facebook/nllb-200-distilled-600M",
-)
-tokenizer.src_lang = "eng_Latn"
-
-# Video Capture 
-cap = cv.VideoCapture(0)
-
-interval = 1.0
-last_time = time.time()
-
-if not cap.isOpened():
-    print("Cannot open camera")
-    exit()
-
-while True:
-    # Capture frame-by-frame
-    ret, frame = cap.read()
-
-    # If frame is read correctly ret is True
-    if not ret:
-        print("Can't receive frame (stream end?). Exiting ...")
-        break
-
-    if time.time() - last_time >= interval:
-        last_time = time.time()
-
-        # Extracting data from the video
+tokenizer.src_lang = "eng_Latn" 
+ 
+# Video Capture  
+cap = cv.VideoCapture(0) 
+ 
+# Storage Variables 
+cap_frame = None 
+ocr_result = None 
+ 
+# Locks 
+frame_lock = threading.Lock() 
+ocr_lock = threading.Lock() 
+ 
+running = threading.Event()
+running.set()
+ 
+# Reads the current frame of the video 
+def video_capture(cap, interval): 
+    global cap_frame, running 
+    print("Start video capture") 
+ 
+    if not cap.isOpened(): 
+        print("Cannot open camera") 
+        running = False 
+        return 
+ 
+    last_time = 0 
+ 
+    while running: 
+        # Capture frame-by-frame 
+        ret, frame = cap.read() 
+ 
+        # If frame is read correctly ret is True 
+        if not ret: 
+            print("Can't receive frame (stream end?). Exiting ...") 
+            running = False 
+            return 
+ 
+        now = time.time() 
+        if now - last_time >= interval: 
+            with frame_lock:  
+                cap_frame = frame.copy() 
+            last_time = now 
+ 
+# Extracts text from an image 
+def ocr_predict(ocr): 
+    global cap_frame, ocr_result, running 
+    print("Start ocr prediction") 
+ 
+    last_frame = None 
+ 
+    while running: 
+        # Getting the frame 
+        with frame_lock: 
+            frame = cap_frame 
+ 
+        if frame is None or frame is last_frame: 
+            time.sleep(0.05) 
+            continue 
+ 
+        last_frame = frame 
+ 
         result = ocr.predict(frame) 
-
-        # Getting the texts in the image
-        texts = result[0]["rec_texts"]
-        confidence = result[0]["rec_scores"]
-
-        # Translating
-        for i, text in enumerate(texts):
-            inputs = tokenizer(text, return_tensors="pt").to(model.device)
-
-            translated_tokens = model.generate(
-                **inputs, 
-                forced_bos_token_id=tokenizer.convert_tokens_to_ids("zho_Hans"), 
+ 
+        with ocr_lock: 
+            ocr_result = result     
+ 
+ 
+# Translates text 
+def translate(tokenizer, model): 
+    global ocr_result, running 
+    print("Start translation") 
+ 
+    last_result = None 
+ 
+    while running: 
+        with ocr_lock: 
+            result = ocr_result 
+ 
+        if result is None or result is last_result: 
+            time.sleep(0.1) 
+            continue 
+ 
+        last_result = result 
+        texts = list(result[0]["rec_texts"]) 
+ 
+        # Translating 
+        batch_size = 16
+        translated = []
+        for start in range(0, len(texts), batch_size):
+            chunk = texts[start:start + batch_size]
+            inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True).to(model.device)
+            out = model.generate(
+                **inputs,
+                forced_bos_token_id=tokenizer.convert_tokens_to_ids("zho_Hans"),
                 max_length=50,
-
             )
+            translated.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
+        texts = translated
+ 
+        result[0]["rec_texts"] = texts 
+ 
+        # Saving the result 
+        for res in result:   
+            res.save_to_img(os.path.join("output", "ocr_result.jpg"))   
+            res.save_to_json(os.path.join("output", "ocr_result.json")) 
+ 
+        time.sleep(0.1) 
+ 
+ 
+threads = [
+    threading.Thread(target=video_capture, args=(cap, 1), daemon=True),
+    threading.Thread(target=ocr_predict, args=(ocr,), daemon=True),
+    threading.Thread(target=translate, args=(tokenizer, model), daemon=True),
+]
 
-            # Translating the texts while filtering out the ones with low confidence
-            texts[i] = texts[i] if confidence[i] < 0.95 else tokenizer.batch_decode(
-                translated_tokens, 
-                skip_special_tokens=True)[0]
+print("Start execution")
+for t in threads:
+    t.start()
 
-        # Saving the result
-        for res in result:  
-            res.save_to_img(os.path.join("output", "ocr_result.jpg"))  
-            res.save_to_json(os.path.join("output", "ocr_result.json"))
-
-    # If q is pressed exit camera loop
-    if cv.waitKey(1) == ord('q'):
-        break
-
-## When everything done, release the capture
-cap.release()
-cv.destroyAllWindows()
-
-
+try:
+    while running.is_set():
+        time.sleep(0.2)
+except KeyboardInterrupt:
+    pass
+finally:
+    running.clear()
+    for t in threads:
+        t.join(timeout=5)
+    cap.release()
+    cv.destroyAllWindows()
