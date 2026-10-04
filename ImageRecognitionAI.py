@@ -3,7 +3,6 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 import cv2 as cv 
 import time 
 import threading 
-from concurrent.futures import ThreadPoolExecutor 
 from PIL import Image, ImageDraw, ImageFont 
 import numpy as np
  
@@ -49,25 +48,25 @@ running.set()
  
 # Reads the current frame of the video 
 def video_capture(cap, interval): 
-    global cap_frame, live_frame, running 
+    global cap_frame, live_frame
     print("Start video capture") 
 
-    # Stops program if camera is not running
+    # Stops program if camera is not opened
     if not cap.isOpened(): 
         print("Cannot open camera") 
-        running = False 
+        running.clear() 
         return 
  
     last_time = 0 
  
-    while running: 
+    while running.is_set(): 
         # Capture frame-by-frame 
         ret, frame = cap.read() 
  
         # If frame is read correctly ret is True 
         if not ret: 
             print("Can't receive frame (stream end?). Exiting ...") 
-            running = False 
+            running.clear()
             return 
 
         with frame_lock:
@@ -82,12 +81,12 @@ def video_capture(cap, interval):
  
 # Extracts text from an image 
 def ocr_predict(ocr): 
-    global cap_frame, ocr_result, running 
+    global cap_frame, ocr_result
     print("Start ocr prediction") 
  
     last_frame = None 
  
-    while running: 
+    while running.is_set(): 
         # Getting the frame 
         with frame_lock: 
             frame = cap_frame 
@@ -107,12 +106,12 @@ def ocr_predict(ocr):
  
 # Translates text 
 def translate(tokenizer, model, batch_size): 
-    global ocr_result, overlay, running
+    global ocr_result, overlay
     print("Start translation") 
  
     last_result = None 
  
-    while running: 
+    while running.is_set(): 
         with ocr_lock: 
             result = ocr_result 
 
@@ -138,13 +137,9 @@ def translate(tokenizer, model, batch_size):
             translated.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
         texts = translated
  
-        result[0]["rec_texts"] = texts 
- 
         # Saving the result 
         with overlay_lock:
             overlay = (result[0]["rec_boxes"], texts)
- 
-        time.sleep(0.1) 
 
 # Helper function for getting the font based on size
 def get_font(size): 
@@ -154,13 +149,17 @@ def get_font(size):
 
 # Draw a rectangular background with the text on top
 def draw_overlay(frame, boxes, texts): 
+    # Does nothing if there is nothing to draw
+    if len(texts) == 0: 
+        return frame
+
     # Converting captured image to RGB for pillow
     img = Image.fromarray(cv.cvtColor(frame, cv.COLOR_BGR2RGB)) 
     draw = ImageDraw.Draw(img) 
 
     # Iterate for each text
     for (x1, y1, x2, y2), text in zip(boxes, texts): 
-        # Draw the box based on the font size
+        # Pick font size based on box height
         font = get_font(max(14, int((y2 - y1) * 0.8))) 
         left, top, right, bottom = draw.textbbox((x1, y1), text, font=font) 
         draw.rectangle( 
@@ -186,7 +185,7 @@ for t in threads:
     t.start()
 
 try:
-    while running:
+    while running.is_set():
         with frame_lock:
             frame = live_frame
 
@@ -204,10 +203,10 @@ try:
 except KeyboardInterrupt:
     pass
 finally:
-    running = False
+    running.clear()
     for t in threads:
         t.join(timeout=5)
 
-    ## When everything done, release the capture
+    # When everything done, release the capture
     cap.release()
     cv.destroyAllWindows()
