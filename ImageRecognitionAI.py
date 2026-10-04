@@ -5,6 +5,8 @@ import time
 import threading 
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_EXCEPTION 
 import os # Only needed for testing purposes 
+
+os.makedirs("output", exist_ok=True) 
  
 # Switch to PP-OCRv5 mobile models 
 ocr = PaddleOCR( 
@@ -34,9 +36,8 @@ ocr_result = None
 frame_lock = threading.Lock() 
 ocr_lock = threading.Lock() 
  
-running = True 
- 
-os.makedirs("output", exist_ok=True) 
+running = threading.Event()
+running.set()
  
 # Reads the current frame of the video 
 def video_capture(cap, interval): 
@@ -109,19 +110,18 @@ def translate(tokenizer, model):
         texts = list(result[0]["rec_texts"]) 
  
         # Translating 
-        for i, text in enumerate(texts): 
-            inputs = tokenizer(text, return_tensors="pt").to(model.device) 
- 
-            translated_tokens = model.generate( 
-                **inputs,  
-                forced_bos_token_id=tokenizer.convert_tokens_to_ids("zho_Hans"),  
-                max_length=50, 
-                ) 
- 
-            # Translating the texts  
-            texts[i] = tokenizer.batch_decode( 
-                translated_tokens,  
-                skip_special_tokens=True)[0] 
+        batch_size = 16
+        translated = []
+        for start in range(0, len(texts), batch_size):
+            chunk = texts[start:start + batch_size]
+            inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True).to(model.device)
+            out = model.generate(
+                **inputs,
+                forced_bos_token_id=tokenizer.convert_tokens_to_ids("zho_Hans"),
+                max_length=50,
+            )
+            translated.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
+        texts = translated
  
         result[0]["rec_texts"] = texts 
  
@@ -133,19 +133,24 @@ def translate(tokenizer, model):
         time.sleep(0.1) 
  
  
-# Running everything 
-with ThreadPoolExecutor(max_workers=3) as executor: 
-    print("Start execution") 
-    capture_future = executor.submit(video_capture, cap, 1) 
-    predict_future = executor.submit(ocr_predict, ocr) 
-    translate_future = executor.submit(translate, tokenizer, model) 
- 
-    done, _ = wait([capture_future, predict_future, translate_future], return_when=FIRST_EXCEPTION) 
-    running = False 
-    for future in done: 
-        future.result() 
- 
-         
-## When everything done, release the capture 
-cap.release() 
-cv.destroyAllWindows()
+threads = [
+    threading.Thread(target=video_capture, args=(cap, 1), daemon=True),
+    threading.Thread(target=ocr_predict, args=(ocr,), daemon=True),
+    threading.Thread(target=translate, args=(tokenizer, model), daemon=True),
+]
+
+print("Start execution")
+for t in threads:
+    t.start()
+
+try:
+    while running.is_set():
+        time.sleep(0.2)
+except KeyboardInterrupt:
+    pass
+finally:
+    running.clear()
+    for t in threads:
+        t.join(timeout=5)
+    cap.release()
+    cv.destroyAllWindows()
