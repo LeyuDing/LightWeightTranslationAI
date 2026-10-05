@@ -5,6 +5,7 @@ import time
 import threading 
 from PIL import Image, ImageDraw, ImageFont 
 import numpy as np
+import torch
  
 # Switch to PP-OCRv5 mobile models 
 ocr = PaddleOCR( 
@@ -20,11 +21,17 @@ ocr = PaddleOCR(
 tokenizer = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M") 
 model = AutoModelForSeq2SeqLM.from_pretrained( 
     "facebook/nllb-200-distilled-600M", 
-) 
+)
+model.to("cuda")
+model.eval() 
+model.generation_config.max_length = None 
+torch.set_num_threads(4)
 tokenizer.src_lang = "eng_Latn" 
  
 # Video Capture  
 cap = cv.VideoCapture(0) 
+cap.set(cv.CAP_PROP_FRAME_WIDTH, 640) 
+cap.set(cv.CAP_PROP_FRAME_HEIGHT, 480)
 
 # Font
 # Just use the generic windows one can be changed later
@@ -35,7 +42,7 @@ fonts = {}
 cap_frame = None 
 live_frame = None 
 ocr_result = None 
-overlay = ([], [])
+overlay = ([], [], None)
  
 # Locks 
 frame_lock = threading.Lock() 
@@ -45,6 +52,10 @@ overlay_lock = threading.Lock()
 # Running
 running = threading.Event()
 running.set()
+
+# Shrinks a frame to a small grayscale image for comparing scenes
+def small_gray(frame): 
+    return cv.cvtColor(cv.resize(frame, (80, 45)), cv.COLOR_BGR2GRAY)
  
 # Reads the current frame of the video 
 def video_capture(cap, interval): 
@@ -69,15 +80,13 @@ def video_capture(cap, interval):
             running.clear()
             return 
 
-        with frame_lock:
-            live_frame = frame
-
         # Only set the captured frame once every interval seconds
         now = time.time() 
-        if now - last_time >= interval: 
-            with frame_lock:  
+        with frame_lock:
+            live_frame = frame
+            if now - last_time >= interval: 
                 cap_frame = frame.copy() 
-            last_time = now 
+                last_time = now
  
 # Extracts text from an image 
 def ocr_predict(ocr): 
@@ -85,6 +94,7 @@ def ocr_predict(ocr):
     print("Start ocr prediction") 
  
     last_frame = None 
+    prev_small = None
  
     while running.is_set(): 
         # Getting the frame 
@@ -96,12 +106,19 @@ def ocr_predict(ocr):
             time.sleep(0.05) 
             continue 
  
-        last_frame = frame 
+        last_frame = frame
+        small = small_gray(frame)
+
+        # Skip ocr if the frame is the same
+        if prev_small is not None and cv.absdiff(small, prev_small).mean() < 3: 
+            continue 
+
+        prev_small = small 
  
         result = ocr.predict(frame) 
  
         with ocr_lock: 
-            ocr_result = result     
+            ocr_result = (result, small)     
  
  
 # Translates text 
@@ -121,6 +138,7 @@ def translate(tokenizer, model, batch_size):
             continue 
  
         last_result = result 
+        result, small = result 
         texts = list(result[0]["rec_texts"]) 
  
         # Translating 
@@ -139,7 +157,7 @@ def translate(tokenizer, model, batch_size):
  
         # Saving the result 
         with overlay_lock:
-            overlay = (result[0]["rec_boxes"], texts)
+            overlay = (result[0]["rec_boxes"], texts, small)
 
 # Helper function for getting the font based on size
 def get_font(size): 
@@ -147,30 +165,38 @@ def get_font(size):
         fonts[size] = ImageFont.truetype(FONT_PATH, size) 
     return fonts[size] 
 
-# Draw a rectangular background with the text on top
-def draw_overlay(frame, boxes, texts): 
-    # Does nothing if there is nothing to draw
-    if len(texts) == 0: 
-        return frame
-
-    # Converting captured image to RGB for pillow
-    img = Image.fromarray(cv.cvtColor(frame, cv.COLOR_BGR2RGB)) 
-    draw = ImageDraw.Draw(img) 
-
-    # Iterate for each text
+# Builds a layer of text and a mask of the background rectangles
+def build_layer(width, height, boxes, texts): 
+    layer = Image.new("RGB", (width, height)) 
+    mask = Image.new("L", (width, height)) 
+    layer_draw = ImageDraw.Draw(layer) 
+    mask_draw = ImageDraw.Draw(mask) 
+ 
     for (x1, y1, x2, y2), text in zip(boxes, texts): 
-        # Pick font size based on box height
         font = get_font(max(14, int((y2 - y1) * 0.8))) 
-        left, top, right, bottom = draw.textbbox((x1, y1), text, font=font) 
-        draw.rectangle( 
+        left, top, right, bottom = layer_draw.textbbox((x1, y1), text, font=font) 
+        mask_draw.rectangle( 
             (min(x1, left) - 4, min(y1, top) - 4, max(x2, right) + 4, max(y2, bottom) + 4), 
-            fill=(0, 0, 0), 
+            fill=255, 
         ) 
+        layer_draw.text((x1, y1), text, font=font, fill=(255, 255, 255)) 
+ 
+    return cv.cvtColor(np.asarray(layer), cv.COLOR_RGB2BGR), np.asarray(mask) > 0
 
-        draw.text((x1, y1), text, font=font, fill=(255, 255, 255)) 
-
-    # Need to convert back to BGR for OpenCV
-    return cv.cvtColor(np.asarray(img), cv.COLOR_RGB2BGR)
+# Applies the translated overlay to a frame when it still matches the scene
+def apply_overlay(frame, state, threshold=8): 
+    with overlay_lock: 
+        current = overlay 
+ 
+    if current is not state["last_overlay"]: 
+        state["last_overlay"] = current 
+        state["layer"], state["mask"] = build_layer(frame.shape[1], frame.shape[0], current[0], current[1]) 
+ 
+    small = current[2] 
+    if small is not None and cv.absdiff(small_gray(frame), small).mean() <= threshold: 
+        frame[state["mask"]] = state["layer"][state["mask"]] 
+ 
+    return frame
  
 
 # Running everything
@@ -184,23 +210,30 @@ print("Start execution")
 for t in threads:
     t.start()
 
-try:
-    while running.is_set():
-        with frame_lock:
-            frame = live_frame
-
-        if frame is not None:
-            with overlay_lock:
-                boxes, texts = overlay
-
-            cv.imshow("Translation", draw_overlay(frame, boxes, texts))
-
-        if cv.waitKey(1) & 0xFF == ord("q"):
-            break
-
-        if not all(t.is_alive() for t in threads):
-            break
-except KeyboardInterrupt:
+last_shown = None 
+last_overlay = None 
+layer = None 
+mask = None 
+visible = False 
+ 
+overlay_state = {"last_overlay": None, "layer": None, "mask": None} 
+last_shown = None 
+ 
+try: 
+    while running.is_set(): 
+        with frame_lock: 
+            frame = live_frame 
+ 
+        if frame is not None and frame is not last_shown: 
+            last_shown = frame 
+            cv.imshow("Translation", apply_overlay(frame, overlay_state)) 
+ 
+        if cv.waitKey(1) & 0xFF == ord("q"): 
+            break 
+ 
+        if not all(t.is_alive() for t in threads): 
+            break 
+except KeyboardInterrupt: 
     pass
 finally:
     running.clear()
