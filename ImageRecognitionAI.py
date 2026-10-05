@@ -40,6 +40,7 @@ fonts = {}
  
 # Storage
 cap_frame = None 
+cap_time = 0
 live_frame = None 
 ocr_result = None 
 overlay = ([], [], None)
@@ -59,7 +60,7 @@ def small_gray(frame):
  
 # Reads the current frame of the video 
 def video_capture(cap, interval): 
-    global cap_frame, live_frame
+    global cap_frame, cap_time, live_frame
     print("Start video capture") 
 
     # Stops program if camera is not opened
@@ -86,11 +87,12 @@ def video_capture(cap, interval):
             live_frame = frame
             if now - last_time >= interval: 
                 cap_frame = frame.copy() 
+                cap_time = time.perf_counter()
                 last_time = now
  
 # Extracts text from an image 
 def ocr_predict(ocr): 
-    global cap_frame, ocr_result
+    global cap_frame, cap_time, ocr_result
     print("Start ocr prediction") 
  
     last_frame = None 
@@ -100,6 +102,7 @@ def ocr_predict(ocr):
         # Getting the frame 
         with frame_lock: 
             frame = cap_frame 
+            captured = cap_time
 
         # Waiting for a new frame
         if frame is None or frame is last_frame: 
@@ -114,11 +117,13 @@ def ocr_predict(ocr):
             continue 
 
         prev_small = small 
- 
+
+        t0 = time.perf_counter() 
         result = ocr.predict(frame) 
+        ocr_ms = (time.perf_counter() - t0) * 1000 
  
         with ocr_lock: 
-            ocr_result = (result, small)     
+            ocr_result = (result, small, captured, ocr_ms)     
  
  
 # Translates text 
@@ -138,9 +143,10 @@ def translate(tokenizer, model, batch_size):
             continue 
  
         last_result = result 
-        result, small = result 
+        result, small, captured, ocr_ms = result
         texts = list(result[0]["rec_texts"]) 
- 
+
+        t0 = time.perf_counter() 
         # Translating 
         # Batches translation for efficiency
         translated = []
@@ -154,10 +160,15 @@ def translate(tokenizer, model, batch_size):
             )
             translated.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
         texts = translated
+        translate_ms = (time.perf_counter() - t0) * 1000
  
         # Saving the result 
         with overlay_lock:
             overlay = (result[0]["rec_boxes"], texts, small)
+
+        total_ms = (time.perf_counter() - captured) * 1000 
+        wait_ms = total_ms - ocr_ms - translate_ms 
+        print(f"lines={len(texts)} | ocr={ocr_ms:.0f} ms | translate={translate_ms:.0f} ms | wait={wait_ms:.0f} ms | total={total_ms:.0f} ms")
 
 # Helper function for getting the font based on size
 def get_font(size): 
@@ -218,7 +229,7 @@ visible = False
  
 overlay_state = {"last_overlay": None, "layer": None, "mask": None} 
 last_shown = None 
- 
+
 try: 
     while running.is_set(): 
         with frame_lock: 
@@ -226,7 +237,7 @@ try:
  
         if frame is not None and frame is not last_shown: 
             last_shown = frame 
-            cv.imshow("Translation", apply_overlay(frame, overlay_state)) 
+            cv.imshow("Translation", apply_overlay(frame, overlay_state))
  
         if cv.waitKey(1) & 0xFF == ord("q"): 
             break 
