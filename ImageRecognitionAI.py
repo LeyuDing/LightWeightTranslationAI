@@ -14,19 +14,22 @@ ocr = PaddleOCR(
     use_doc_orientation_classify=False, 
     use_doc_unwarping=False, 
     use_textline_orientation=True, 
+    device="gpu:0",
     engine="transformers", 
 )  
- 
 # Tokenizer for the translator 
 tokenizer = AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M") 
 model = AutoModelForSeq2SeqLM.from_pretrained( 
     "facebook/nllb-200-distilled-600M", 
+    torch_dtype=torch.float16,
 )
 model.to("cuda")
 model.eval() 
 model.generation_config.max_length = None 
 torch.set_num_threads(4)
 tokenizer.src_lang = "eng_Latn" 
+
+print(next(model.parameters()).device)
  
 # Video Capture  
 cap = cv.VideoCapture(0) 
@@ -91,7 +94,7 @@ def video_capture(cap, interval):
                 last_time = now
  
 # Extracts text from an image 
-def ocr_predict(ocr): 
+def ocr_predict(ocr, threshold=6): 
     global cap_frame, cap_time, ocr_result
     print("Start ocr prediction") 
  
@@ -112,9 +115,12 @@ def ocr_predict(ocr):
         last_frame = frame
         small = small_gray(frame)
 
+        diff = cv.absdiff(small, prev_small).mean() if prev_small is not None else None
+
         # Skip ocr if the frame is the same
-        if prev_small is not None and cv.absdiff(small, prev_small).mean() < 3: 
+        if prev_small is not None and cv.absdiff(small, prev_small).mean() < threshold: 
             continue 
+        print(f"diff={diff}")
 
         prev_small = small 
 
@@ -132,6 +138,7 @@ def translate(tokenizer, model, batch_size):
     print("Start translation") 
  
     last_result = None 
+    cache = {}
  
     while running.is_set(): 
         with ocr_lock: 
@@ -149,17 +156,27 @@ def translate(tokenizer, model, batch_size):
         t0 = time.perf_counter() 
         # Translating 
         # Batches translation for efficiency
-        translated = []
-        for start in range(0, len(texts), batch_size):
-            chunk = texts[start:start + batch_size]
+        # Also caches translations
+        missing = [t for t in dict.fromkeys(texts) if t not in cache]
+
+        for start in range(0, len(missing), batch_size):
+            chunk = missing[start:start + batch_size]
             inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True).to(model.device)
             out = model.generate(
                 **inputs,
                 forced_bos_token_id=tokenizer.convert_tokens_to_ids("zho_Hans"),
-                max_length=50,
+                num_beams=1,
+                do_sample=False,
+                max_new_tokens=40,
             )
-            translated.extend(tokenizer.batch_decode(out, skip_special_tokens=True))
-        texts = translated
+            cache.update(zip(chunk, tokenizer.batch_decode(out, skip_special_tokens=True)))
+
+        texts = [cache[t] for t in texts]
+
+        if len(cache) > 2000:
+            cache.clear()
+
+
         translate_ms = (time.perf_counter() - t0) * 1000
  
         # Saving the result 
@@ -212,7 +229,7 @@ def apply_overlay(frame, state, threshold=8):
 
 # Running everything
 threads = [
-    threading.Thread(target=video_capture, args=(cap, 1), daemon=True),
+    threading.Thread(target=video_capture, args=(cap, 0.1), daemon=True),
     threading.Thread(target=ocr_predict, args=(ocr,), daemon=True),
     threading.Thread(target=translate, args=(tokenizer, model, 16), daemon=True),
 ]
